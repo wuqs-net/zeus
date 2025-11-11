@@ -207,6 +207,13 @@ class NVIDIAGPU(gpu_common.GPU):
         pynvml.nvmlDeviceResetGpuLockedClocks(self.handle)
 
     @_handle_nvml_errors
+    def getGpuFrequency(self) -> int:
+        """Return the current GPU clock frequencies. Units: MHz."""
+        return pynvml.nvmlDeviceGetClockInfo(
+            self.handle, pynvml.NVML_CLOCK_GRAPHICS
+        )
+
+    @_handle_nvml_errors
     def getAveragePowerUsage(self) -> int:
         """Return the average power draw of the GPU. Units: mW."""
         if self._is_grace_hopper:

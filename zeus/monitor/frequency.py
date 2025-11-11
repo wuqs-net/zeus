@@ -1,4 +1,4 @@
-"""Monitor the temperature of GPUs."""
+"""Monitor the frequency of GPUs."""
 
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def _cleanup_temperature_process(
+def _cleanup_frequency_process(
     stop_event: EventClass,
     process: SpawnProcess,
 ) -> None:
-    """Idempotent cleanup function for temperature monitoring process."""
+    """Idempotent cleanup function for frequency monitoring process."""
     # Signal the process to stop
     stop_event.set()
 
@@ -42,21 +42,21 @@ def _cleanup_temperature_process(
 
 
 @dataclass
-class TemperatureSample:
-    """A single temperature measurement sample."""
+class FrequencySample:
+    """A single frequency measurement sample."""
 
     timestamp: float
     gpu_index: int
-    temperature_c: int
+    frequency_mhz: int
 
 
-class TemperatureMonitor:
-    """Monitor GPU temperature over time.
+class FrequencyMonitor:
+    """Monitor GPU frequency over time.
 
     This class provides:
-    1. Continuous temperature monitoring in a background process
+    1. Continuous frequency monitoring in a background process
     2. Timeline export with deduplication
-    3. Point-in-time temperature queries
+    3. Point-in-time frequency queries
 
     !!! Note
         The current implementation only supports cases where all GPUs are homogeneous
@@ -75,14 +75,14 @@ class TemperatureMonitor:
         update_period: float = 1.0,
         max_samples_per_gpu: int | None = None,
     ) -> None:
-        """Initialize the temperature monitor.
+        """Initialize the frequency monitor.
 
         Args:
             gpu_indices: Indices of the GPUs to monitor. If None, monitor all GPUs.
-            update_period: Update period of the temperature monitor in seconds.
-                Defaults to 1.0 second. Temperature typically doesn't change as
+            update_period: Update period of the frequency monitor in seconds.
+                Defaults to 1.0 second. Frequency typically doesn't change as
                 rapidly as power, so a longer update period is reasonable.
-            max_samples_per_gpu: Maximum number of temperature samples to keep per GPU
+            max_samples_per_gpu: Maximum number of frequency samples to keep per GPU
                 in memory. If None (default), unlimited samples are kept.
         """
         if gpu_indices is not None and not gpu_indices:
@@ -97,79 +97,79 @@ class TemperatureMonitor:
         )
         if not self.gpu_indices:
             raise ValueError("At least one GPU index must be specified")
-        logger.info("Monitoring temperature of GPUs %s", self.gpu_indices)
+        logger.info("Monitoring frequency of GPUs %s", self.gpu_indices)
 
         self.update_period = update_period
 
-        # Temperature samples are collected for each device index.
-        self.temperature_samples: dict[int, collections.deque[TemperatureSample]] = {}
+        # Frequency samples are collected for each device index.
+        self.frequency_samples: dict[int, collections.deque[FrequencySample]] = {}
         for gpu_idx in self.gpu_indices:
-            self.temperature_samples[gpu_idx] = collections.deque(
+            self.frequency_samples[gpu_idx] = collections.deque(
                 maxlen=max_samples_per_gpu
             )
 
-        # Spawn temperature collector process
+        # Spawn frequency collector process
         ctx = mp.get_context("spawn")
-        self.temperature_queue = ctx.Queue()
-        self.temperature_ready_event = ctx.Event()
-        self.temperature_stop_event = ctx.Event()
-        self.temperature_process = ctx.Process(
-            target=_temperature_polling_process,
+        self.frequency_queue = ctx.Queue()
+        self.frequency_ready_event = ctx.Event()
+        self.frequency_stop_event = ctx.Event()
+        self.frequency_process = ctx.Process(
+            target=_frequency_polling_process,
             kwargs=dict(
                 gpu_indices=self.gpu_indices,
-                data_queue=self.temperature_queue,
-                ready_event=self.temperature_ready_event,
-                stop_event=self.temperature_stop_event,
+                data_queue=self.frequency_queue,
+                ready_event=self.frequency_ready_event,
+                stop_event=self.frequency_stop_event,
                 update_period=update_period,
             ),
             daemon=True,
-            name="zeus-temperature-monitor",
+            name="zeus-frequency-monitor",
         )
-        self.temperature_process.start()
+        self.frequency_process.start()
 
         # Cleanup function
         self._finalizer = weakref.finalize(
             self,
-            _cleanup_temperature_process,
-            self.temperature_stop_event,
-            self.temperature_process,
+            _cleanup_frequency_process,
+            self.frequency_stop_event,
+            self.frequency_process,
         )
 
         # Wait for subprocess to signal it's ready
-        logger.info("Waiting for temperature monitoring subprocess to be ready...")
-        if not self.temperature_ready_event.wait(timeout=10.0):
+        logger.info("Waiting for frequency monitoring subprocess to be ready...")
+        if not self.frequency_ready_event.wait(timeout=10.0):
             logger.warning(
-                "Temperature monitor subprocess did not signal ready within timeout"
+                "Frequency monitor subprocess did not signal ready within timeout"
             )
-        logger.info("Temperature monitoring subprocess is ready")
+        logger.info("Frequency monitoring subprocess is ready")
 
     def stop(self) -> None:
         """Stop the monitoring process."""
         if self._finalizer.alive:
             self._finalizer()
 
-    def _process_temperature_queue_data(self) -> None:
-        """Process all pending temperature samples from the queue."""
-        if not hasattr(self, "temperature_queue"):
+    def _process_frequency_queue_data(self) -> None:
+        """Process all pending frequency samples from the queue."""
+        if not hasattr(self, "frequency_queue"):
             return
 
         while True:
             try:
-                sample = self.temperature_queue.get_nowait()
+                sample = self.frequency_queue.get_nowait()
                 if sample == "STOP":
                     break
-                assert isinstance(sample, TemperatureSample)
-                self.temperature_samples[sample.gpu_index].append(sample)
+                assert isinstance(sample, FrequencySample)
+                self.frequency_samples[sample.gpu_index].append(sample)
             except Empty:
                 break
 
-    def get_temperature_timeline(
+    def get_frequency_timeline(
         self,
         gpu_index: int | None = None,
         start_time: float | None = None,
         end_time: float | None = None,
     ) -> dict[int, list[tuple[float, int]]]:
-        """Get temperature timeline for specific GPU(s).
+        """Get frequency timeline for specific GPU(s).
 
         Args:
             gpu_index: Specific GPU index, or None for all GPUs
@@ -178,29 +178,29 @@ class TemperatureMonitor:
 
         Returns:
             Dictionary mapping GPU indices to timeline data.
-            Timeline data is list of (timestamp, temperature_celsius) tuples.
+            Timeline data is list of (timestamp, frequency_mhz) tuples.
         """
         # Process any pending queue data
-        self._process_temperature_queue_data()
+        self._process_frequency_queue_data()
 
         # Determine which GPUs to query
         target_gpus = [gpu_index] if gpu_index is not None else self.gpu_indices
 
         result = {}
         for gpu_idx in target_gpus:
-            if gpu_idx not in self.temperature_samples:
+            if gpu_idx not in self.frequency_samples:
                 continue
 
             # Extract timeline from samples
             timeline = []
-            for sample in self.temperature_samples[gpu_idx]:
+            for sample in self.frequency_samples[gpu_idx]:
                 # Apply time filters
                 if start_time is not None and sample.timestamp < start_time:
                     continue
                 if end_time is not None and sample.timestamp > end_time:
                     continue
 
-                timeline.append((sample.timestamp, sample.temperature_c))
+                timeline.append((sample.timestamp, sample.frequency_mhz))
 
             # Sort by timestamp
             timeline.sort(key=lambda x: x[0])
@@ -208,30 +208,30 @@ class TemperatureMonitor:
 
         return result
 
-    def get_temperature(self, time: float | None = None) -> dict[int, int] | None:
-        """Get the GPU temperature at a specific time point.
+    def get_frequency(self, time: float | None = None) -> dict[int, int] | None:
+        """Get the GPU frequency at a specific time point.
 
         Args:
-            time: Time point to get the temperature at. If None, get the temperature
+            time: Time point to get the frequency at. If None, get the frequency
                 at the last recorded time point.
 
         Returns:
-            A dictionary mapping GPU indices to the temperature of the GPU at the
-            specified time point. If there are no temperature readings, return None.
+            A dictionary mapping GPU indices to the frequency of the GPU at the
+            specified time point. If there are no frequency readings, return None.
         """
         # Process any pending queue data
-        self._process_temperature_queue_data()
+        self._process_frequency_queue_data()
 
         result = {}
         for gpu_idx in self.gpu_indices:
-            samples = self.temperature_samples[gpu_idx]
+            samples = self.frequency_samples[gpu_idx]
             if not samples:
                 return None
 
             if time is None:
                 # Get the most recent sample
                 latest_sample = samples[-1]
-                result[gpu_idx] = latest_sample.temperature_c
+                result[gpu_idx] = latest_sample.frequency_mhz
             else:
                 # Find the closest sample to the requested time using bisect
                 timestamps = [sample.timestamp for sample in samples]
@@ -250,25 +250,25 @@ class TemperatureMonitor:
                         if time - before.timestamp <= after.timestamp - time
                         else after
                     )
-                result[gpu_idx] = closest_sample.temperature_c
+                result[gpu_idx] = closest_sample.frequency_mhz
 
         return result
 
 
-def _temperature_polling_process(
+def _frequency_polling_process(
     gpu_indices: list[int],
     data_queue: mp.Queue,
     ready_event: EventClass,
     stop_event: EventClass,
     update_period: float,
 ) -> None:
-    """Polling process for GPU temperature with deduplication."""
+    """Polling process for GPU frequency with deduplication."""
     try:
         # Get GPUs
         gpus = get_gpus()
 
-        # Track previous temperature values for deduplication
-        prev_temperature: dict[int, int] = {}
+        # Track previous frequency values for deduplication
+        prev_frequency: dict[int, int] = {}
 
         # Signal that this process is ready to start monitoring
         ready_event.set()
@@ -279,28 +279,28 @@ def _temperature_polling_process(
 
             for gpu_index in gpu_indices:
                 try:
-                    temperature_c = gpus.getGpuTemperature(gpu_index)
+                    frequency_mhz = gpus.getGpuFrequency(gpu_index)
 
-                    # Deduplication: only send if temperature changed
-                    if (
-                        gpu_index in prev_temperature
-                        and prev_temperature[gpu_index] == temperature_c
-                    ):
-                        continue
+                    # Deduplication: only send if frequency changed
+                    # if (
+                    #     gpu_index in prev_frequency
+                    #     and prev_frequency[gpu_index] == frequency_mhz
+                    # ):
+                    #     continue
 
-                    prev_temperature[gpu_index] = temperature_c
+                    prev_frequency[gpu_index] = frequency_mhz
 
-                    # Create and send temperature sample
-                    sample = TemperatureSample(
+                    # Create and send frequency sample
+                    sample = FrequencySample(
                         timestamp=timestamp,
                         gpu_index=gpu_index,
-                        temperature_c=temperature_c,
+                        frequency_mhz=frequency_mhz,
                     )
 
                     data_queue.put(sample)
                 except ZeusGPUNotSupportedError as e:
                     logger.warning(
-                        "GPU %d temperature reading not supported: %s",
+                        "GPU %d frequency reading not supported: %s",
                         gpu_index,
                         e,
                     )
@@ -308,7 +308,7 @@ def _temperature_polling_process(
                     break
                 except Exception as e:
                     logger.exception(
-                        "Error polling temperature for GPU %d: %s",
+                        "Error polling frequency for GPU %d: %s",
                         gpu_index,
                         e,
                     )
@@ -324,7 +324,7 @@ def _temperature_polling_process(
         pass
     except Exception as e:
         logger.exception(
-            "Exiting temperature polling process due to error: %s",
+            "Exiting frequency polling process due to error: %s",
             e,
         )
         raise e

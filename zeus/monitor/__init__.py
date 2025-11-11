@@ -7,8 +7,12 @@ module can come in handy.
 
 If users wish to monitor GPU temperature over time, the [`temperature`][zeus.monitor.temperature]
 module can come in handy.
+
+If users wish to monitor GPU frequency over time, the [`frequency`][zeus.monitor.frequency]
+module can come in handy.
 """
 
 from zeus.monitor.energy import ZeusMonitor, Measurement
 from zeus.monitor.power import PowerMonitor
 from zeus.monitor.temperature import TemperatureMonitor
+from zeus.monitor.frequency import FrequencyMonitor

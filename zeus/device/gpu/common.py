@@ -97,6 +97,11 @@ class GPU(abc.ABC):
         pass
 
     @abc.abstractmethod
+    def getGpuFrequency(self) -> int:
+        """Return the current GPU clock frequency. Units: MHz."""
+        pass
+
+    @abc.abstractmethod
     def getAveragePowerUsage(self) -> int:
         """Return the average power usage of the GPU. Units: mW."""
         pass
@@ -257,6 +262,10 @@ class GPUs(abc.ABC):
         """Reset the locked GPU clocks to the default."""
         self._warn_sys_admin()
         self.gpus[gpu_index].resetGpuLockedClocks(_block)
+    
+    def getGpuFrequency(self, gpu_index: int) -> int:
+        """Return the current GPU clock frequency. Units: MHz."""
+        return self.gpus[gpu_index].getGpuFrequency()
 
     def getAveragePowerUsage(self, gpu_index: int) -> int:
         """Return the average power usage of the GPU. Units: mW."""
@@ -380,6 +389,10 @@ class EmptyGPUs(GPUs):
         raise ValueError("No GPUs available.")
 
     def resetGpuLockedClocks(self, gpu_index: int, _block: bool = True) -> None:
+        """Raise a ValueError as no GPUs are available."""
+        raise ValueError("No GPUs available.")
+    
+    def getGpuFrequency(self, gpu_index: int) -> int:
         """Raise a ValueError as no GPUs are available."""
         raise ValueError("No GPUs available.")
 
