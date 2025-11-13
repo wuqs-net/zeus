@@ -25,9 +25,10 @@ from __future__ import annotations
 import atexit
 from pathlib import Path
 from abc import ABC, abstractmethod
+import time
 
 from zeus.callback import Callback
-from zeus.monitor import ZeusMonitor
+from zeus.monitor import ZeusMonitor, FrequencyMonitor
 from zeus.utils.framework import all_reduce, is_distributed
 from zeus.utils.logging import get_logger
 from zeus.utils.metric import zeus_cost
@@ -190,6 +191,7 @@ class PowerLimitMeasurement(BaseModel):
     power_limit: PositiveInt  # In Watts.
     energy: PositiveFloat
     time: PositiveFloat
+    frequency: dict[int, list[tuple[float, float]]]
 
 
 class _PowerLimitMeasurementList(BaseModel):
@@ -224,6 +226,7 @@ class GlobalPowerLimitOptimizer(Callback):
     def __init__(
         self,
         monitor: ZeusMonitor,
+        frequency_monitor: FrequencyMonitor | None = None,
         optimum_selector: OptimumSelector | None = None,
         wait_steps: int = 1,
         warmup_steps: int = 10,
@@ -259,6 +262,7 @@ class GlobalPowerLimitOptimizer(Callback):
             raise ValueError("pl_step must be positive.")
 
         self.monitor = monitor
+        self.frequency_monitor = frequency_monitor
         self.optimum_selector = optimum_selector or ZeusCost(
             eta_knob=0.5,
             world_size=len(monitor.gpu_indices),
@@ -401,6 +405,7 @@ class GlobalPowerLimitOptimizer(Callback):
                     current_power_limit=self.state.current_power_limit,
                     steps=self.profile_steps,
                 )
+                self.start_time = time.time()
                 self.monitor.begin_window(
                     f"__GlobalPowerLimitOptimizer_{self.state.current_power_limit // 1000}",
                 )
@@ -411,6 +416,9 @@ class GlobalPowerLimitOptimizer(Callback):
                 measurement = self.monitor.end_window(
                     f"__GlobalPowerLimitOptimizer_{self.state.current_power_limit // 1000}",
                 )
+                freq_measurement = dict()
+                if self.frequency_monitor is not None:
+                    freq_measurement = self.frequency_monitor.get_frequency_timeline(0, self.start_time, time.time())
                 self.logger.info(
                     "Finished profiling for power limit %d W.",
                     self.state.current_power_limit // 1000,
@@ -425,6 +433,7 @@ class GlobalPowerLimitOptimizer(Callback):
                             )
                         ),
                         time=max(all_reduce([measurement.time], operation="max")),
+                        frequency=freq_measurement,
                     )
                 )
                 # If we're done profiling all power limits, compute the optimal
