@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 import time
+import json
 from enum import Enum
 
 import torch
@@ -19,7 +20,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 
 # ZEUS
-from zeus.monitor import ZeusMonitor
+from zeus.monitor import ZeusMonitor, FrequencyMonitor
 from zeus.optimizer.power_limit import MaxSlowdownConstraint, GlobalPowerLimitOptimizer
 from zeus.utils.env import get_env
 
@@ -123,10 +124,11 @@ def main():
     model.cuda(args.gpu)
 
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    optimizer = torch.optim.SGD(
+    # Use AdaDelta instead of SGD
+    optimizer = torch.optim.Adadelta(
         model.parameters(),
-        args.lr,
-        momentum=args.momentum,
+        rho=0.9,
+        eps=1e-06,
         weight_decay=args.weight_decay,
     )
     scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
@@ -174,20 +176,37 @@ def main():
         pin_memory=True,
     )
 
+    metadata = {
+        "model_name": args.arch,
+        "dataset": "imagenet",
+        "batch_size": args.batch_size,
+        "optimizer": "adadelta",
+        "profile_steps": 40,
+        "steps_per_epoch": len(train_loader),
+    }
+    profile_prefix = f"profile_{args.arch}_b{args.batch_size}_p{40}"
+    if args.record_freq:
+        profile_prefix += "_freq"
+    with open(f"{profile_prefix}.meta.json", "w") as f:
+        json.dump(metadata, f)
+
     ################################## The important part #####################################
     # ZeusMonitor is used to profile the time and energy consumption of the GPU.
     monitor = ZeusMonitor(gpu_indices=[args.gpu])
+    frequency_monitor = FrequencyMonitor(gpu_indices=[args.gpu])
 
     # GlobalPowerLimitOptimizer profiles each power limit and selects the best one.
     # This is the power limit optimizer that's in the Zeus paper.
     plo = GlobalPowerLimitOptimizer(
         monitor=monitor,
+        frequency_monitor=frequency_monitor,
         optimum_selector=MaxSlowdownConstraint(
             factor=get_env("ZEUS_MAX_SLOWDOWN", float, 1.1),
         ),
         warmup_steps=10,
         profile_steps=40,
         pl_step=25,
+        profile_path=f"{profile_prefix}.json",
     )
 
     for epoch in range(args.epochs):
