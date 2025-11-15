@@ -1,23 +1,23 @@
-"""Optimizers that select the optimum power limit.
+"""Optimizers that select the optimum frequency.
 
 This module contains the following pieces:
 
-- [`GlobalPowerLimitOptimizer`][zeus.optimizer.power_limit.GlobalPowerLimitOptimizer]
+- [`GlobalFrequencyOptimizer`][zeus.optimizer.frequency.GlobalFrequencyOptimizer]
   is the main class that implements the state machine
-  and the logic for profiling power limits and selecting
-  the optimum power limit.
-- [`PowerLimitMeasurement`][zeus.optimizer.power_limit.PowerLimitMeasurement] and various
+  and the logic for profiling frequencies and selecting
+  the optimum frequency.
+- [`FrequencyMeasurement`][zeus.optimizer.frequency.FrequencyMeasurement] and various
   state classes are helpers that support the state machine.
-- [`OptimumSelector`][zeus.optimizer.power_limit.OptimumSelector]
-  is an abstract base class for selecting the optimum power limit
-  from a list of power limit profiling results. There are concrete classes
+- [`OptimumSelector`][zeus.optimizer.frequency.OptimumSelector]
+  is an abstract base class for selecting the optimum frequency
+  from a list of frequency profiling results. There are concrete classes
   that implement different selection strategies, like
-  [minimizing energy][zeus.optimizer.power_limit.Energy],
-  [minimizing time][zeus.optimizer.power_limit.Time],
-  [minimizing the Zeus time-energy cost][zeus.optimizer.power_limit.ZeusCost],
-  or [selecting the lowest power limit that meets the given maximum training time slowdown factor][zeus.optimizer.power_limit.MaxSlowdownConstraint].
-- [`HFGlobalPowerLimitOptimizer`][zeus.optimizer.power_limit.HFGlobalPowerLimitOptimizer]
-  is a wrapper for the Hugging Face `TrainerCallback` class that uses `GlobalPowerLimitOptimizer`.
+  [minimizing energy][zeus.optimizer.frequency.Energy],
+  [minimizing time][zeus.optimizer.frequency.Time],
+  [minimizing the Zeus time-energy cost][zeus.optimizer.frequency.ZeusCost],
+  or [selecting the lowest frequency that meets the given maximum training time slowdown factor][zeus.optimizer.frequency.MaxSlowdownConstraint].
+- [`HFGlobalFrequencyOptimizer`][zeus.optimizer.frequency.HFGlobalFrequencyOptimizer]
+  is a wrapper for the Hugging Face `TrainerCallback` class that uses `GlobalFrequencyOptimizer`.
 """
 
 from __future__ import annotations
@@ -40,37 +40,37 @@ from typing import TYPE_CHECKING
 
 
 class OptimumSelector(ABC):
-    """Base class for optimum power limit selectors."""
+    """Base class for optimum frequency selectors."""
 
     @abstractmethod
-    def select(self, measurements: list[PowerLimitMeasurement]) -> int:
-        """Select the optimal power limit (W) from measurements."""
+    def select(self, measurements: list[FrequencyMeasurement]) -> tuple[int, int]:
+        """Select the optimal frequency (MHz) from measurements."""
 
 
 class Energy(OptimumSelector):
-    """Selects the power limit that minimizes energy consumption."""
+    """Selects the frequency that minimizes energy consumption."""
 
-    def select(self, measurements: list[PowerLimitMeasurement]) -> int:
-        """Select the optimal power limit (W) from measurements."""
-        return min(measurements, key=lambda x: x.energy).power_limit
+    def select(self, measurements: list[FrequencyMeasurement]) -> tuple[int, int]:
+        """Select the optimal frequency (MHz) from measurements."""
+        return (lambda x: (x.min_frequency, x.max_frequency))(min(measurements, key=lambda x: x.energy))
 
 
 class Time(OptimumSelector):
-    """Selects the power limit that minimizes training time.
+    """Selects the frequency that minimizes training time.
 
-    This may not necessarily choose the maximum power limit, as time profiling
+    This may not necessarily choose the maximum frequency, as time profiling
     results can be slightly noisy. However, we believe that's actually better
-    because it means that training time is very similar among higher power limits,
-    but lower power limit will consume less power.
+    because it means that training time is very similar among higher frequencies,
+    but lower frequencies will consume less power.
     """
 
-    def select(self, measurements: list[PowerLimitMeasurement]) -> int:
-        """Select the optimal power limit (W) from measurements."""
-        return min(measurements, key=lambda x: x.time).power_limit
+    def select(self, measurements: list[FrequencyMeasurement]) -> tuple[int, int]:
+        """Select the optimal frequency (MHz) from measurements."""
+        return (lambda x: (x.min_frequency, x.max_frequency))(min(measurements, key=lambda x: x.time))
 
 
 class ZeusCost(OptimumSelector):
-    r"""Selects the power limit that minimizes a linear Zeus time-energy cost function.
+    r"""Selects the frequency that minimizes a linear Zeus time-energy cost function.
 
     Cost function is $\eta \cdot \text{Energy} + (1 - \eta) \cdot \text{MaxPower} \cdot \text{Time}$.
     """
@@ -90,14 +90,14 @@ class ZeusCost(OptimumSelector):
         self.eta_knob = eta_knob
         self.world_size = world_size
 
-    def select(self, measurements: list[PowerLimitMeasurement]) -> int:
-        """Select the optimal power limit (W) from measurements."""
+    def select(self, measurements: list[FrequencyMeasurement]) -> tuple[int, int]:
+        """Select the optimal frequency (MHz) from measurements."""
         max_power = (
-            max(measurement.power_limit for measurement in measurements)
+            get_gpus(True).getPowerManagementLimitConstraints(0)[1]
             * self.world_size
         )
         zeus_cost_map = {
-            measurement.power_limit: zeus_cost(
+            (measurement.min_frequency, measurement.max_frequency): zeus_cost(
                 energy=measurement.energy,
                 time=measurement.time,
                 eta_knob=self.eta_knob,
@@ -109,7 +109,7 @@ class ZeusCost(OptimumSelector):
 
 
 class MaxSlowdownConstraint(OptimumSelector):
-    """Selects the minumum power limit that does not slow down training by more than the given factor."""
+    """Selects the minumum frequency that does not slow down training by more than the given factor."""
 
     def __init__(self, factor: float) -> None:
         """Initialize the selector.
@@ -124,102 +124,107 @@ class MaxSlowdownConstraint(OptimumSelector):
 
         self.factor = factor
 
-    def select(self, measurements: list[PowerLimitMeasurement]) -> int:
-        """Select the optimal power limit (W) from measurements."""
-        feasible_power_limits = []
-        max_power = max(measurement.power_limit for measurement in measurements)
+    def select(self, measurements: list[FrequencyMeasurement]) -> tuple[int, int]:
+        """Select the optimal frequency (MHz) from measurements."""
+        feasible_frequencies = []
+        max_frequency = max(measurement.max_frequency for measurement in measurements)
         shortest_time = next(
             measurement.time
             for measurement in measurements
-            if measurement.power_limit == max_power
+            if measurement.max_frequency == max_frequency
         )
         for measurement in measurements:
             if measurement.time <= self.factor * shortest_time:
-                feasible_power_limits.append(measurement.power_limit)
-        return min(feasible_power_limits)
+                feasible_frequencies.append(measurement.max_frequency)
+        return min(feasible_frequencies), min(feasible_frequencies)
 
 
 class Ready(BaseModel):
-    """State for when we are ready to start measuring the next power limit.
+    """State for when we are ready to start measuring the next frequency.
 
     Initial state of the state machine if no previous profiling results were given.
     `Ready` -> `Warmup` after `step`'th `on_step_begin`.
     """
 
-    next_power_limit: PositiveInt
+    next_min_frequency: PositiveInt
+    next_max_frequency: PositiveInt
     steps: PositiveInt
 
 
 class Warmup(BaseModel):
-    """State for when we are warming up for a power limit.
+    """State for when we are warming up for a frequency.
 
     `Warmup` -> `Profiling` on the `steps`'th `on_step_begin`.
     `Warmup` -> `Ready` on `on_epoch_end` before `steps`'th `on_step_begin`.
     """
 
-    current_power_limit: PositiveInt
+    current_min_frequency: PositiveInt
+    current_max_frequency: PositiveInt
     steps: PositiveInt
 
 
 class Profiling(BaseModel):
-    """State for when we are profiling a power limit.
+    """State for when we are profiling a frequency.
 
     `Profiling` -> `Warmup` after `steps`'th `on_step_begin` and
-        there are still power limits left to profile.
+        there are still frequencies left to profile.
     `Profiling` -> `Done` after `steps`'th `on_step_begin` and
-        there are no more power limits left to profile.
+        there are no more frequencies left to profile.
     `Profiling` -> `Ready` on `on_epoch_end` before `steps`'th `on_step_begin`.
     """
 
-    current_power_limit: PositiveInt
+    current_min_frequency: PositiveInt
+    current_max_frequency: PositiveInt
     steps: PositiveInt
 
 
 class Done(BaseModel):
-    """State for when we are done profiling all power limits.
+    """State for when we are done profiling all frequencies.
 
     Initial state of the state machine if previous profiling results were given.
     Final state of the state machine in any case.
     """
 
-    optimal_power_limit: PositiveInt
+    optimal_min_frequency: PositiveInt
+    optimal_max_frequency: PositiveInt
 
 
-class PowerLimitMeasurement(BaseModel):
-    """POD for GPU energy and time measurements for one power limit (W)."""
+class FrequencyMeasurement(BaseModel):
+    """POD for GPU energy and time measurements for one frequency lock (MHz)."""
 
-    power_limit: PositiveInt  # In Watts.
+    min_frequency: PositiveInt  # In MHz.
+    max_frequency: PositiveInt  # In MHz.
     energy: PositiveFloat
     time: PositiveFloat
     frequency: dict[int, list[tuple[float, float]]]
 
 
-class _PowerLimitMeasurementList(BaseModel):
-    """Proxy class to save and load a list of `PowerLimitMeasurement`s."""
+class _FrequencyMeasurementList(BaseModel):
+    """Proxy class to save and load a list of `FrequencyMeasurement`s."""
 
-    measurements: list[PowerLimitMeasurement]
+    measurements: list[FrequencyMeasurement]
 
 
-class GlobalPowerLimitOptimizer(Callback):
-    """Optimizer for the power limit knob.
+class GlobalFrequencyOptimizer(Callback):
+    """Optimizer for the frequency knob.
 
-    This optimizer uses the JIT profiling log to determine the optimal power limit.
+    This optimizer uses the JIT profiling log to determine the optimal frequency.
 
     ## Usage with distributed data parallelism
 
-    The global power limit optimizer expects one process to control each GPU used for training.
+    The global frequency optimizer expects one process to control each GPU used for training.
     For instance, `torchrun` will automatically spawn one process for each GPU on the node.
     Correspondingly, the [`ZeusMonitor`][zeus.monitor.energy.ZeusMonitor] instance passed in
     should be monitoring **one GPU**: the one being managed by the current process. The index of
     this GPU would typically match the local rank of the process. In the case of PyTorch, users would have
     called `torch.cuda.set_device` early on, so `torch.cuda.current_device` will give you the GPU index.
-    `GlobalPowerLimitOptimizer` will internally do an AllReduce across all GPUs to aggregate
-    time and energy measurements, and then select the globally optimal power limit.
+    `GlobalFrequencyOptimizer` will internally do an AllReduce across all GPUs to aggregate
+    time and energy measurements, and then select the globally optimal frequency.
 
 
     ```python
     monitor = ZeusMonitor(gpu_indices=[local_rank])  # pass in local rank to gpu_indices.
-    plo = GlobalPowerLimitOptimizer(monitor)
+    fo = GlobalFrequencyOptimizer(monitor)
     ```
     """
 
@@ -231,7 +236,7 @@ class GlobalPowerLimitOptimizer(Callback):
         wait_steps: int = 1,
         warmup_steps: int = 10,
         profile_steps: int = 40,
-        pl_step: int = 25,
+        freq_step: int = 100,
         profile_path: str | Path | None = None,
     ) -> None:
         r"""Initialize the optimizer.
@@ -244,9 +249,9 @@ class GlobalPowerLimitOptimizer(Callback):
             wait_steps: Number of steps to pass by before doing anything at the beginning.
                 Useful if you have something like `torch.backends.cudnn.benchmark=True`,
                 because the first iteration won't be representative of the rest of the iterations.
-            warmup_steps: Number of warmup iterations for each power limit.
-            profile_steps: Number of profie iterations for each power limit.
-            pl_step: The stride between power limits to explore, in unites of Watts.
+            warmup_steps: Number of warmup iterations for each frequency.
+            profile_steps: Number of profile iterations for each frequency.
+            freq_step: The stride between frequencies to explore, in units of MHz.
             profile_path: If the path points to an existing file, load the profile from the file
                 and do not run any profiling. If the path points to a non-existing file, profile
                 and save the profile to the file. If `None`, do not save or load any profile.
@@ -258,8 +263,8 @@ class GlobalPowerLimitOptimizer(Callback):
             raise ValueError("warmup_steps must be non-negative.")
         if profile_steps <= 0:
             raise ValueError("profile_steps must be positive.")
-        if pl_step <= 0:
-            raise ValueError("pl_step must be positive.")
+        if freq_step <= 0:
+            raise ValueError("freq_step must be positive.")
 
         self.monitor = monitor
         self.frequency_monitor = frequency_monitor
@@ -269,7 +274,6 @@ class GlobalPowerLimitOptimizer(Callback):
         )
         self.warmup_steps = warmup_steps
         self.profile_steps = profile_steps
-        self.pl_step = pl_step * 1000  # Internally, we use milliWatts.
         self.profile_path = (
             Path(profile_path) if isinstance(profile_path, str) else profile_path
         )
@@ -284,33 +288,39 @@ class GlobalPowerLimitOptimizer(Callback):
             self.logger.warning(
                 "Distributed training is enabled with %d GPUs monitored. "
                 "For distributed training, it is recommended to monitor only one GPU per `ZeusMonitor` instance "
-                "since `GlobalPowerLimitOptimizer` performs an all-reduce operation internally over all devices.",
+                "since `GlobalFrequencyOptimizer` performs an all-reduce operation internally over all devices.",
                 len(monitor.gpu_indices),
             )
 
-        # Set the range of power limits to explore.
-        # Assert that supported power limits ranges are uniform across GPUs.
-        pls = []
+        # Set the range of frequencies to explore.
+        # Assert that supported frequency ranges are uniform across GPUs.
+        freqs = []
         for index in monitor.gpu_indices:
-            pls.append(gpus.getPowerManagementLimitConstraints(index))
-        if not all(pls[0] == pl for pl in pls):
-            raise ValueError("Power limits ranges are not uniform across GPUs.")
-        self.power_limits = list(range(pls[0][1], pls[0][0] - 1, -self.pl_step))
+            max_mem_freq = max(gpus.getSupportedMemoryClocks(index))
+            freqs.append(gpus.getSupportedGraphicsClocks(index, max_mem_freq))
+        if not all(freqs[0] == freq for freq in freqs):
+            raise ValueError("Frequency ranges are not uniform across GPUs.")
+        self.frequencies: list[int] = []
+        last_freq = 0
+        for freq in sorted(freqs[0]):
+            if freq - last_freq >= freq_step or last_freq == 0:
+                self.frequencies.append(freq)
+                last_freq = freq
 
-        # Turn on persistence mode and set to the highest power limit.
+        # Turn on persistence mode.
         try:
             for index in monitor.gpu_indices:
                 gpus.setPersistenceMode(index, enabled=True)
         except ZeusGPUNoPermissionError as ze:
             raise RuntimeError(
-                "SYS_ADMIN capability is required to modify GPU power limits. See "
+                "SYS_ADMIN capability is required to modify GPU frequency locks. See "
                 "https://ml.energy/zeus/getting_started/#system-privileges "
                 "for more information."
             ) from ze
-        self.current_power_limit = 0
+        self.current_frequency = (0, 0)
 
-        # Store `Measurement` objects in a list, one for each power limit.
-        self.measurements: list[PowerLimitMeasurement] = []
+        # Store `Measurement` objects in a list, one for each frequency.
+        self.measurements: list[FrequencyMeasurement] = []
 
         # State for the profiler state machine.
         self.state: Ready | Warmup | Profiling | Done
@@ -320,10 +330,12 @@ class GlobalPowerLimitOptimizer(Callback):
             self.logger.info("JIT profiling enabled.")
             self.logger.info("Will wait %d step(s) before profiling.", wait_steps)
             self.state = Ready(
-                next_power_limit=self.power_limits[0], steps=wait_steps + 1
+                next_min_frequency=self.frequencies[0],
+                next_max_frequency=self.frequencies[0],
+                steps=wait_steps + 1
             )
-            self.logger.info("Set power limit to the maximum before starting.")
-            self._set_power_limit(max(self.power_limits))
+            self.logger.info("Reset frequency lock before starting.")
+            self._reset_frequency()
         elif not self.profile_path.exists():
             self.logger.info(
                 "JIT Profiling enabled. Profile will be saved to '%s'.",
@@ -331,12 +343,14 @@ class GlobalPowerLimitOptimizer(Callback):
             )
             self.logger.info("Will wait %d step(s) before profiling.", wait_steps)
             self.state = Ready(
-                next_power_limit=self.power_limits[0], steps=wait_steps + 1
+                next_min_frequency=self.frequencies[0],
+                next_max_frequency=self.frequencies[0],
+                steps=wait_steps + 1,
             )
-            self.logger.info("Set power limit to the maximum before starting.")
-            self._set_power_limit(max(self.power_limits))
+            self.logger.info("Reset frequency lock before starting.")
+            self._reset_frequency()
         else:
-            self.measurements = _PowerLimitMeasurementList.parse_file(
+            self.measurements = _FrequencyMeasurementList.parse_file(
                 self.profile_path,
             ).measurements
             # self.measurements = _PowerLimitMeasurementList.model_validate_json(
@@ -346,15 +360,18 @@ class GlobalPowerLimitOptimizer(Callback):
             self.logger.info(
                 "Loaded previous profiling results from '%s'.", str(self.profile_path)
             )
-            optimal_power_limit = self._compute_optimal_power_limit()
+            optimal_min_frequency, optimal_max_frequency = self._compute_optimal_frequency()
             self.logger.info(
-                "Optimal power limit is %d W.", optimal_power_limit // 1000
+                "Optimal frequency is %d MHz - %d MHz.", optimal_min_frequency, optimal_max_frequency
             )
-            self.state = Done(optimal_power_limit=optimal_power_limit)
-            self._set_power_limit(self.state.optimal_power_limit)
+            self.state = Done(
+                optimal_min_frequency=optimal_min_frequency,
+                optimal_max_frequency=optimal_max_frequency,
+            )
+            self._set_frequency(self.state.optimal_min_frequency, self.state.optimal_max_frequency)
 
-        # Restore all GPUs back to their maximum power limit on exit.
-        atexit.register(lambda: self._set_power_limit(max(self.power_limits)))
+        # Restore all GPUs back to no frequency lock on exit.
+        atexit.register(lambda: self._reset_frequency())
 
     def on_epoch_end(self) -> None:
         """Mark the end of a training epoch."""
@@ -364,17 +381,22 @@ class GlobalPowerLimitOptimizer(Callback):
         elif isinstance(self.state, (Warmup, Profiling)):
             # Warmup/Profiling stage interrupted by the end of an epoch.
             self.logger.info(
-                "%s phase for %d W interrupted by the end of a training epoch.",
+                "%s phase for %d MHz - %d MHz interrupted by the end of a training epoch.",
                 type(self.state).__name__,
-                self.state.current_power_limit // 1000,
+                self.state.current_min_frequency,
+                self.state.current_max_frequency,
             )
             if isinstance(self.state, Profiling):
                 self.monitor.end_window(
-                    f"__GlobalPowerLimitOptimizer_{self.state.current_power_limit // 1000}",
+                    f"__GlobalFrequencyOptimizer_{self.state.current_min_frequency}_{self.state.current_max_frequency}",
                     cancel=True,
                 )
-            self.state = Ready(next_power_limit=self.state.current_power_limit, steps=1)
-            self._set_power_limit(max(self.power_limits))
+            self.state = Ready(
+                next_min_frequency=self.state.current_min_frequency,
+                next_max_frequency=self.state.current_max_frequency,
+                steps=1
+            )
+            self._reset_frequency()
 
         elif isinstance(self.state, Done):
             pass
@@ -385,12 +407,14 @@ class GlobalPowerLimitOptimizer(Callback):
             self.state.steps -= 1
             if self.state.steps == 0:
                 self.logger.info(
-                    "Starting warmup for power limit %d W.",
-                    self.state.next_power_limit // 1000,
+                    "Starting warmup for frequency %d - %d MHz.",
+                    self.state.next_min_frequency,
+                    self.state.next_max_frequency,
                 )
-                self._set_power_limit(self.state.next_power_limit)
+                self._set_frequency(self.state.next_min_frequency, self.state.next_max_frequency)
                 self.state = Warmup(
-                    current_power_limit=self.state.next_power_limit,
+                    current_min_frequency=self.state.next_min_frequency,
+                    current_max_frequency=self.state.next_max_frequency,
                     steps=self.warmup_steps,
                 )
 
@@ -398,35 +422,39 @@ class GlobalPowerLimitOptimizer(Callback):
             self.state.steps -= 1
             if self.state.steps == 0:
                 self.logger.info(
-                    "Starting actual profiling for power limit %d W.",
-                    self.state.current_power_limit // 1000,
+                    "Starting actual profiling for frequency %d - %d MHz.",
+                    self.state.current_min_frequency,
+                    self.state.current_max_frequency,
                 )
                 self.state = Profiling(
-                    current_power_limit=self.state.current_power_limit,
+                    current_min_frequency=self.state.current_min_frequency,
+                    current_max_frequency=self.state.current_max_frequency,
                     steps=self.profile_steps,
                 )
                 self.start_time = time.time()
                 self.monitor.begin_window(
-                    f"__GlobalPowerLimitOptimizer_{self.state.current_power_limit // 1000}",
+                    f"__GlobalFrequencyOptimizer_{self.state.current_min_frequency}_{self.state.current_max_frequency}",
                 )
 
         elif isinstance(self.state, Profiling):
             self.state.steps -= 1
             if self.state.steps == 0:
                 measurement = self.monitor.end_window(
-                    f"__GlobalPowerLimitOptimizer_{self.state.current_power_limit // 1000}",
+                    f"__GlobalFrequencyOptimizer_{self.state.current_min_frequency}_{self.state.current_max_frequency}",
                 )
                 freq_measurement = dict()
                 if self.frequency_monitor is not None:
                     freq_measurement = self.frequency_monitor.get_frequency_timeline(0, self.start_time, time.time())
                 self.logger.info(
-                    "Finished profiling for power limit %d W.",
-                    self.state.current_power_limit // 1000,
+                    "Finished profiling for frequency %d - %d MHz.",
+                    self.state.current_min_frequency,
+                    self.state.current_max_frequency,
                 )
 
                 self.measurements.append(
-                    PowerLimitMeasurement(
-                        power_limit=self.state.current_power_limit // 1000,
+                    FrequencyMeasurement(
+                        min_frequency=self.state.current_min_frequency,
+                        max_frequency=self.state.current_max_frequency,
                         energy=sum(
                             all_reduce(
                                 list(measurement.gpu_energy.values()), operation="sum"
@@ -436,62 +464,74 @@ class GlobalPowerLimitOptimizer(Callback):
                         frequency=freq_measurement,
                     )
                 )
-                # If we're done profiling all power limits, compute the optimal
-                # power limit and transition to the Done state. Otherwise, move
-                # on to the Warmup phase for the next power limit.
-                current_power_limit_index = self.power_limits.index(
-                    self.state.current_power_limit
+                # If we're done profiling all frequencies, compute the optimal
+                # frequency and transition to the Done state. Otherwise, move
+                # on to the Warmup phase for the next frequency.
+                current_frequency_index = self.frequencies.index(
+                    self.state.current_max_frequency
                 )
-                if current_power_limit_index == len(self.power_limits) - 1:
+                if current_frequency_index == len(self.frequencies) - 1:
+                    optimal_min_frequency, optimal_max_frequency =  self._compute_optimal_frequency()
                     self.state = Done(
-                        optimal_power_limit=self._compute_optimal_power_limit(),
+                        optimal_min_frequency=optimal_min_frequency,
+                        optimal_max_frequency=optimal_max_frequency,
                     )
-                    self._set_power_limit(self.state.optimal_power_limit)
+                    self._set_frequency(self.state.optimal_min_frequency, self.state.optimal_max_frequency)
                     self._save_profile()
                 else:
-                    next_power_limit = self.power_limits[current_power_limit_index + 1]
+                    next_frequency = self.frequencies[current_frequency_index + 1]
                     self.logger.info(
-                        "Starting warmup for power limit %d W.",
-                        next_power_limit // 1000,
+                        "Starting warmup for frequency %d - %d MHz.",
+                        next_frequency, next_frequency
                     )
-                    self._set_power_limit(next_power_limit)
+                    self._set_frequency(next_frequency, next_frequency)
                     self.state = Warmup(
-                        current_power_limit=next_power_limit,
+                        current_min_frequency=next_frequency,
+                        current_max_frequency=next_frequency,
                         steps=self.warmup_steps,
                     )
 
         elif isinstance(self.state, Done):
             pass
 
-    def _set_power_limit(self, power_limit: int) -> None:
-        """Set the power limit for all GPUs.
+    def _set_frequency(self, min_frequency: int, max_frequency: int) -> None:
+        """Set the frequency for all GPUs.
 
         Args:
-            power_limit: The power limit to set, in milliWatts.
+            min_frequency: The minimum frequency to set, in MHz.
+            max_frequency: The maximum frequency to set, in MHz.
         """
         gpus = get_gpus()
-        self.logger.info("Setting power limit to %d W.", power_limit // 1000)
-        if self.current_power_limit == power_limit:
+        self.logger.info("Setting frequency to %d MHz - %d MHz.", min_frequency, max_frequency)
+        if self.current_frequency == (min_frequency, max_frequency):
             return
         for index in self.monitor.gpu_indices:
-            gpus.setPowerManagementLimit(index, power_limit)
-        self.current_power_limit = power_limit
+            gpus.setGpuLockedClocks(index, min_frequency, max_frequency)
+        self.current_frequency = (min_frequency, max_frequency)
+    
+    def _reset_frequency(self) -> None:
+        """Reset the frequency lock for all GPUs."""
+        gpus = get_gpus()
+        self.logger.info("Resetting frequency lock.")
+        for index in self.monitor.gpu_indices:
+            gpus.resetGpuLockedClocks(index)
+        self.current_frequency = (0, 0)
 
-    def _compute_optimal_power_limit(self) -> int:
-        """Compute the optimal power limit in milliWatts."""
-        optimal_power_limit = self.optimum_selector.select(self.measurements) * 1000
-        self.logger.info("Optimal power limit is %d W.", optimal_power_limit // 1000)
-        return optimal_power_limit
+    def _compute_optimal_frequency(self) -> tuple[int, int]:
+        """Compute the optimal frequency in MHz."""
+        optimal_min_frequency, optimal_max_frequency = self.optimum_selector.select(self.measurements)
+        self.logger.info("Optimal frequency is %d MHz.", optimal_max_frequency)
+        return optimal_min_frequency, optimal_max_frequency
 
     def _save_profile(self) -> None:
-        """Save JIT profiling results and the optimal power limit to a JSON file."""
+        """Save JIT profiling results and the optimal frequency to a JSON file."""
         if self.profile_path is None:
             return
 
         assert isinstance(self.state, Done)
         with self.profile_path.open("w", encoding="utf-8") as f:
             f.write(
-                _PowerLimitMeasurementList(measurements=self.measurements).json(
+                _FrequencyMeasurementList(measurements=self.measurements).json(
                     indent=4
                 ),
             )
